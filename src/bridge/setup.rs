@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     bridge::NeovimWriter,
-    settings::{SettingLocation, Settings, config::config_path},
+    settings::{FontConfigState, SettingLocation, Settings, config::config_path},
     version::BUILD_VERSION,
 };
 
@@ -73,9 +73,17 @@ pub async fn setup_neovide_specific_state(
         })
         .collect::<Vec<_>>();
 
+    let line_scales = settings
+        .get::<FontConfigState>()
+        .line_scales
+        .into_iter()
+        .map(|(group, scale)| (Value::from(group), Value::from(scale)))
+        .collect::<Vec<_>>();
+
     nvim.exec_lua(
         INIT_LUA,
         call_args![nvim_dict! {
+            "line_scales" => Value::Map(line_scales),
             "neovide_channel_id" => api_information.channel,
             "neovide_version" => BUILD_VERSION,
             "config_path" => config_path().to_string_lossy().into_owned(),

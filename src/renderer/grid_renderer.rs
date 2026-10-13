@@ -19,7 +19,10 @@ use crate::{
     window::WindowSettings,
 };
 
-use super::{box_drawing::BoxDrawingSettings, fonts::font_options::FontOptions};
+use super::{
+    box_drawing::BoxDrawingSettings,
+    fonts::font_options::{FontOptions, NO_LINE_SCALE},
+};
 
 pub struct GridRenderer {
     pub shaper: CachingShaper,
@@ -71,6 +74,11 @@ impl GridRenderer {
 
     pub fn font_names(&self) -> Vec<String> {
         self.shaper.font_names()
+    }
+
+    /// Size multiplier for a whole grid line carrying this style.
+    pub fn line_scale(&self, style: &Option<Arc<Style>>) -> f32 {
+        style.as_ref().map_or(NO_LINE_SCALE, |style| self.shaper.line_scale(&style.hl_names))
     }
 
     pub fn handle_scale_factor_update(&mut self, scale_factor: f64) {

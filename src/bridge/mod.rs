@@ -369,6 +369,20 @@ async fn update_colorscheme(
     }
 }
 
+/// Sorted so the list handed to Neovim does not churn between runs.
+fn line_scales(config: &Config) -> Vec<(String, f32)> {
+    let mut scales = config
+        .font
+        .as_ref()
+        .and_then(|font| font.line_scale.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    scales.sort_by(|(left, _), (right, _)| left.cmp(right));
+    scales
+}
+
 impl NeovimRuntime {
     pub fn new(clipboard: ClipboardHandle) -> Result<Self, Error> {
         let runtime = Builder::new_multi_thread().enable_all().build()?;
@@ -406,6 +420,7 @@ impl NeovimRuntime {
 
         let mut font_config_state = settings.get::<FontConfigState>();
         font_config_state.has_font = config.font.is_some();
+        font_config_state.line_scales = line_scales(config);
         settings.set(&font_config_state);
 
         let session = match self.runtime().block_on(create_neovim_session(

@@ -70,6 +70,10 @@ fn filter_failed_fonts(mut options: FontOptions, font_keys: &HashSet<FontKey>) -
     options
 }
 
+fn swash_variations(variations: &[FontVariation]) -> impl Iterator<Item = (&str, f32)> {
+    variations.iter().map(|variation| (variation.tag.as_str(), variation.value))
+}
+
 impl CachingShaper {
     pub fn new(scale_factor: f32) -> CachingShaper {
         let options = FontOptions::default();
@@ -208,6 +212,10 @@ impl CachingShaper {
         self.font_loader.font_names()
     }
 
+    pub fn line_scale(&self, hl_names: &[String]) -> f32 {
+        self.options.line_scale(hl_names)
+    }
+
     fn info(&mut self) -> (Metrics, f32) {
         if let Some(info) = self.font_info {
             return info;
@@ -215,8 +223,12 @@ impl CachingShaper {
 
         let font_pair = self.current_font_pair();
         let size = self.current_size();
-        let mut shaper =
-            self.shape_context.builder(font_pair.swash_font.as_ref()).size(size).build();
+        let mut shaper = self
+            .shape_context
+            .builder(font_pair.swash_font.as_ref())
+            .variations(swash_variations(font_pair.variations()))
+            .size(size)
+            .build();
         shaper.add_str("M");
         let metrics = shaper.metrics();
         let mut advance = metrics.average_width;
@@ -425,6 +437,7 @@ impl CachingShaper {
                 .shape_context
                 .builder(font_pair.swash_font.as_ref())
                 .features(features.iter().map(|(name, value)| (name.as_ref(), *value)))
+                .variations(swash_variations(font_pair.variations()))
                 .size(current_size)
                 .build();
 
@@ -515,7 +528,7 @@ mod tests {
         let failed_font_keys = failed_families
             .into_iter()
             .map(|family| FontKey {
-                font_desc: Some(FontDescription { family, style: None }),
+                font_desc: Some(FontDescription { family, ..Default::default() }),
                 hinting: options.hinting.clone(),
                 edging: options.edging.clone(),
             })
@@ -573,15 +586,18 @@ mod tests {
     fn filters_failed_normal_fonts_and_preserves_order() {
         let options = FontOptions {
             normal: vec![
-                FontDescription { family: "Missing".to_string(), style: None },
-                FontDescription { family: "DejaVu Sans Mono".to_string(), style: None },
-                FontDescription { family: "Courier New".to_string(), style: None },
+                FontDescription { family: "Missing".to_string(), ..Default::default() },
+                FontDescription { family: "DejaVu Sans Mono".to_string(), ..Default::default() },
+                FontDescription { family: "Courier New".to_string(), ..Default::default() },
             ],
             ..FontOptions::default()
         };
 
         let failed_font_keys = HashSet::from([FontKey {
-            font_desc: Some(FontDescription { family: "Missing".to_string(), style: None }),
+            font_desc: Some(FontDescription {
+                family: "Missing".to_string(),
+                ..Default::default()
+            }),
             hinting: options.hinting.clone(),
             edging: options.edging.clone(),
         }]);
@@ -591,8 +607,8 @@ mod tests {
         assert_eq!(
             filtered.normal,
             vec![
-                FontDescription { family: "DejaVu Sans Mono".to_string(), style: None },
-                FontDescription { family: "Courier New".to_string(), style: None },
+                FontDescription { family: "DejaVu Sans Mono".to_string(), ..Default::default() },
+                FontDescription { family: "Courier New".to_string(), ..Default::default() },
             ]
         );
     }
@@ -600,12 +616,15 @@ mod tests {
     #[test]
     fn does_not_empty_normal_fonts_when_every_normal_font_fails() {
         let options = FontOptions {
-            normal: vec![FontDescription { family: "Missing".to_string(), style: None }],
+            normal: vec![FontDescription { family: "Missing".to_string(), ..Default::default() }],
             ..FontOptions::default()
         };
 
         let failed_font_keys = HashSet::from([FontKey {
-            font_desc: Some(FontDescription { family: "Missing".to_string(), style: None }),
+            font_desc: Some(FontDescription {
+                family: "Missing".to_string(),
+                ..Default::default()
+            }),
             hinting: options.hinting.clone(),
             edging: options.edging.clone(),
         }]);

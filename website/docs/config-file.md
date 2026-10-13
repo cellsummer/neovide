@@ -115,6 +115,7 @@ applies a new Neovim grid size, and `maximized` updates the live maximized state
 - `hinting`: optional,
 - `edging`: optional,
 - `underline_offset`: optional
+- `line_scale`: optional, `{ "<highlight group>" = <scale> }`
 
 Settings `size`, `width`, `hinting` and `edging` can be found in
 [Configuration](configuration.md).
@@ -139,6 +140,19 @@ Settings `size`, `width`, `hinting` and `edging` can be found in
   - Font feature is a string with format `+<feature>`, `-<feature>` or `<feature>=<value>`,
     e.g. `+ss01`, `-calt`, `ss02=2`. `+<feature>` is a shorthand for `<feature>=1`,
     `-<feature>` is a shorthand for `<feature>=0`.
+- `line_scale` makes whole grid lines bigger. A line carrying one of the listed highlight groups
+  is drawn at that multiple of the normal size, covering that many grid rows downward and that
+  many cell widths rightward. The largest matching scale on the line wins, and the value is
+  clamped to `1.0` - `8.0`.
+  - Neovim is never told about the scaling: it keeps its uniform grid, so **you must reserve the
+    rows the oversized line grows into**, with blank lines or `virt_lines` extmarks below it.
+    Without them the oversized line draws over the following lines.
+  - The whole line scales, not only the matching text. For a heading that is the intent, since
+    the line is the heading, but it also takes along anything Neovim draws in the same row,
+    including the `'number'` and sign columns.
+  - Neovim's own column arithmetic stays uniform, so anything measuring screen columns on a
+    scaled line (`virtualedit`, `showbreak`, wrapping) disagrees with what is drawn. The cursor
+    and mouse are corrected; line wrapping is not.
 - `underline_offset` is a float that defines the offset between the character baseline and the
   underline.
   - If not specified, it will be decided automatically, either if the font contains the required
@@ -156,6 +170,41 @@ size = 18
 [font.features]
 "MonoLisa Nerd Font" = [ "+ss01", "+ss07", "+ss11", "-calt", "+ss09", "+ss02", "+ss14" ]
 ```
+
+Bigger markdown headings, with two reserved rows below an `H1` and one below an `H2`:
+
+```toml
+[font]
+normal = "MonoLisa Nerd Font"
+size = 18
+
+[font.line_scale]
+"@markup.heading.1" = 1.5
+"@markup.heading.2" = 1.25
+```
+
+The keys are highlight group names as `:Inspect` shows them. Neovim only reports the *resolved*
+group to a UI, so a group that merely links elsewhere would never arrive under its own name -
+every `@markup.heading.N` links to `Title` by default. Neovide handles this for you: each group
+named here is made to own its attributes at startup and after every `:colorscheme`, which leaves
+the appearance untouched while making the group distinguishable.
+
+Reserving the rows is the one part left to you, since only your config knows whether a plugin
+already does it. Neovide ships an opt-in helper that adds the virtual lines for every line
+carrying a scaled group in the visible range:
+
+```lua
+vim.api.nvim_create_autocmd({ "BufEnter", "TextChanged", "InsertLeave", "WinScrolled" }, {
+    callback = function()
+        neovide.reserve_line_scale_rows()
+    end,
+})
+```
+
+It takes an optional `{ buf, first, last }` (1-indexed, as `line()` reports) and returns how many
+lines it gave rows to. It costs one `vim.inspect_pos` per line in the range, so prefer the default
+visible range. Skip it if a plugin already reserves space - render-markdown.nvim's
+`heading.below`, for instance - or the gaps stack.
 
 Specify font weight:
 

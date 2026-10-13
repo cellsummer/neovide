@@ -5,14 +5,18 @@ use std::{
     rc::Rc,
 };
 
-use log::trace;
+use log::{trace, warn};
 use lru::LruCache;
-use skia_safe::{Data, Font, FontHinting as SkiaHinting, FontMgr, font::Edging as SkiaEdging};
+use skia_safe::{
+    Data, Font, FontArguments, FontHinting as SkiaHinting, FontMgr, FourByteTag, Typeface,
+    font::Edging as SkiaEdging,
+    font_arguments::{VariationPosition, variation_position::Coordinate},
+};
 
 use crate::{
     profiling::tracy_zone,
     renderer::fonts::{
-        font_options::{CoarseStyle, FontDescription, FontEdging, FontHinting},
+        font_options::{CoarseStyle, FontDescription, FontEdging, FontHinting, FontVariation},
         swash_font::SwashFont,
     },
 };
@@ -27,21 +31,84 @@ pub struct FontPair {
 }
 
 impl FontPair {
-    fn new(key: FontKey, mut skia_font: Font) -> Option<FontPair> {
+    fn new(key: FontKey, skia_font: Font) -> Option<FontPair> {
+        let (font_data, index) = font_data_and_index(&skia_font.typeface())?;
+        let swash_font = SwashFont::from_data(font_data, index)?;
+
+        Some(Self::from_parts(key, skia_font, swash_font))
+    }
+
+    fn from_parts(key: FontKey, mut skia_font: Font, swash_font: SwashFont) -> FontPair {
         skia_font.set_subpixel(true);
         skia_font.set_baseline_snap(true);
         skia_font.set_hinting(font_hinting(&key.hinting));
         skia_font.set_edging(font_edging(&key.edging));
 
-        let typeface = skia_font.typeface();
-        let (font_data, index) = typeface.to_font_bytes()?;
-        // Only the lower 16 bits are part of the index, the rest indicates named instances. But we
-        // don't care about those here, since we are just loading the font, so ignore them
-        let index = (index & 0xFFFF) as usize;
-        let swash_font = SwashFont::from_data(font_data, index)?;
-
-        Some(Self { key, skia_font, swash_font })
+        Self { key, skia_font, swash_font }
     }
+
+    /// Axes that swash has to shape with, so that advances match the rasterized glyphs.
+    pub fn variations(&self) -> &[FontVariation] {
+        self.key.font_desc.as_ref().map(|desc| desc.variations.as_slice()).unwrap_or_default()
+    }
+}
+
+fn font_data_and_index(typeface: &Typeface) -> Option<(Vec<u8>, usize)> {
+    let (font_data, index) = typeface.to_font_bytes()?;
+    // Only the lower 16 bits are part of the index, the rest indicates named instances. But we
+    // don't care about those here, since we are just loading the font, so ignore them
+    Some((font_data, (index & 0xFFFF) as usize))
+}
+
+/// Moves the typeface to the requested position in the variation design space.
+fn apply_variations(
+    typeface: Typeface,
+    variations: &[FontVariation],
+    collection_index: usize,
+) -> Typeface {
+    if variations.is_empty() {
+        return typeface;
+    }
+
+    let axes = typeface.variation_design_parameters().unwrap_or_default();
+    // Skia resets every axis that the position leaves out to the font default, so start from the
+    // position that style matching resolved instead of from the requested axes alone.
+    let mut position = typeface.variation_design_position().unwrap_or_default();
+
+    for variation in variations {
+        let tag = variation_tag(&variation.tag);
+
+        let Some(axis) = axes.iter().find(|axis| axis.tag == tag) else {
+            warn!("Font {} has no variation axis {}", typeface.family_name(), variation.tag);
+            continue;
+        };
+
+        let value = variation.value.clamp(axis.min, axis.max);
+        match position.iter_mut().find(|coordinate| coordinate.axis == tag) {
+            Some(coordinate) => coordinate.value = value,
+            None => position.push(Coordinate { axis: tag, value }),
+        }
+    }
+
+    let mut arguments = FontArguments::new();
+    // DirectWrite declines the clone when the index does not match the matched face.
+    arguments.set_collection_index(collection_index);
+    let arguments =
+        arguments.set_variation_design_position(VariationPosition { coordinates: &position });
+
+    match typeface.clone_with_arguments(&arguments) {
+        Some(varied) => varied,
+        None => {
+            warn!("Font {} does not support variations", typeface.family_name());
+            typeface
+        }
+    }
+}
+
+fn variation_tag(tag: &str) -> FourByteTag {
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(tag.as_bytes());
+    FourByteTag::from(u32::from_be_bytes(bytes))
 }
 
 impl PartialEq for FontPair {
@@ -94,7 +161,17 @@ impl FontLoader {
         if let Some(desc) = &font_key.font_desc {
             let (family, style) = desc.as_family_and_font_style();
             let typeface = self.font_mgr.match_family_style(family, style)?;
-            FontPair::new(font_key, Font::from_typeface(typeface, self.font_size))
+
+            // Read the font data before cloning, a varied typeface has no bytes of its own.
+            let (font_data, index) = font_data_and_index(&typeface)?;
+            let swash_font = SwashFont::from_data(font_data, index)?;
+            let typeface = apply_variations(typeface, &desc.variations, index);
+
+            Some(FontPair::from_parts(
+                font_key,
+                Font::from_typeface(typeface, self.font_size),
+                swash_font,
+            ))
         } else {
             let data = Data::new_copy(DEFAULT_FONT);
             let typeface = self.font_mgr.new_from_data(data, 0)?;
@@ -139,6 +216,7 @@ impl FontLoader {
             font_desc: Some(FontDescription {
                 family: typeface.family_name(),
                 style: coarse_style.name().map(str::to_string),
+                ..Default::default()
             }),
             hinting: FontHinting::default(),
             edging: FontEdging::default(),
@@ -210,7 +288,7 @@ mod tests {
         let missing_font = FontKey {
             font_desc: Some(FontDescription {
                 family: "missing-font-family".to_string(),
-                style: None,
+                ..Default::default()
             }),
             hinting: FontHinting::default(),
             edging: FontEdging::default(),
@@ -245,5 +323,53 @@ mod tests {
         });
 
         assert!(has_colored_pixel, "Skia did not render the COLRv1 glyph in color");
+    }
+
+    fn variable_typeface() -> Typeface {
+        let data = Data::new_copy(font_test_data::VAZIRMATN_VAR);
+        FontMgr::new().new_from_data(data, 0).unwrap()
+    }
+
+    fn weight_position(typeface: &Typeface) -> f32 {
+        let position = typeface.variation_design_position().unwrap();
+        let weight = variation_tag("wght");
+
+        position.iter().find(|coordinate| coordinate.axis == weight).unwrap().value
+    }
+
+    #[test]
+    fn moves_typeface_to_requested_axis_value() {
+        let variations = vec![FontVariation { tag: "wght".to_string(), value: 700.0 }];
+
+        let varied = apply_variations(variable_typeface(), &variations, 0);
+
+        assert_eq!(weight_position(&varied), 700.0);
+    }
+
+    #[test]
+    fn clamps_axis_value_to_the_font_range() {
+        let variations = vec![FontVariation { tag: "wght".to_string(), value: 5000.0 }];
+
+        let varied = apply_variations(variable_typeface(), &variations, 0);
+        let max = varied
+            .variation_design_parameters()
+            .unwrap()
+            .iter()
+            .find(|axis| axis.tag == variation_tag("wght"))
+            .unwrap()
+            .max;
+
+        assert_eq!(weight_position(&varied), max);
+    }
+
+    #[test]
+    fn ignores_axes_the_font_does_not_have() {
+        let typeface = variable_typeface();
+        let default_weight = weight_position(&typeface);
+        let variations = vec![FontVariation { tag: "CASL".to_string(), value: 1.0 }];
+
+        let varied = apply_variations(typeface, &variations, 0);
+
+        assert_eq!(weight_position(&varied), default_weight);
     }
 }

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use skia_safe::Color4f;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +45,9 @@ pub struct Style {
     /// Blend level (0-100).
     pub blend: u8,
     pub underline: Option<UnderlineStyle>,
+    /// Highlight groups this style was defined for, so the renderer can map them to its own font
+    /// decisions. Only known when Neovim reports hlstate (`ext_hlstate`).
+    pub hl_names: Arc<[String]>,
 }
 
 impl Style {
@@ -55,6 +60,7 @@ impl Style {
             strikethrough: false,
             blend: 0,
             underline: None,
+            hl_names: Arc::from([]),
         }
     }
 

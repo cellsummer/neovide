@@ -12,7 +12,9 @@ use crate::{
     bridge::EditorMode,
     editor::{Cursor, CursorShape, Word},
     profiling::{tracy_plot, tracy_zone},
-    renderer::{GridRenderer, RenderedWindow, animation_utils::*},
+    renderer::{
+        GridRenderer, RenderedWindow, animation_utils::*, fonts::font_options::NO_LINE_SCALE,
+    },
     settings::{ParseFromValue, Settings},
     units::{
         GridPos, GridScale, GridSize, PixelPos, PixelRect, PixelSize, PixelVec, to_skia_point,
@@ -252,6 +254,8 @@ pub struct CursorRenderer {
     previous_vfx_mode: cursor_vfx::VfxModeList,
     window_has_focus: bool,
     jumped: bool,
+    /// Scale of the line the cursor sits on, so the caret tracks an oversized line.
+    line_scale: f32,
 
     settings: Arc<Settings>,
 }
@@ -265,6 +269,7 @@ impl CursorRenderer {
             blink_status: BlinkStatus::new(),
             previous_cursor_position: None,
             previous_cursor_shape: None,
+            line_scale: NO_LINE_SCALE,
             cmdline_ctx: CmdlineCtx::Inactive,
             cursor_vfxs: vec![],
             previous_vfx_mode: cursor_vfx::VfxModeList::default(),
@@ -327,8 +332,15 @@ impl CursorRenderer {
         let previous_destination = self.destination;
         let mut scroll_delta = PixelVec::ZERO;
         let new_cursor_pos = if let Some(window) = windows.get(&self.cursor.parent_window_id) {
+            self.line_scale = window.line_scale_at_row(cursor_grid_position.y as isize);
+            let line_scale = self.line_scale;
+
             let destination_at = |scroll: f32| {
-                let mut grid = cursor_grid_position_f + window.grid_current_position.to_vector();
+                // An oversized line spreads its columns by the factor it is drawn with
+                let mut cursor_position = cursor_grid_position_f;
+                cursor_position.x *= line_scale;
+
+                let mut grid = cursor_position + window.grid_current_position.to_vector();
                 grid.y -= scroll;
 
                 let top_border = window.viewport_margins.top as f32;
@@ -352,6 +364,7 @@ impl CursorRenderer {
                 self.destination - destination_at(scroll - window.scroll_animation_delta);
             Some((window.id, cursor_grid_position))
         } else {
+            self.line_scale = NO_LINE_SCALE;
             self.destination = cursor_grid_position_f * grid_scale;
             Some((0, cursor_grid_position))
         };
@@ -424,24 +437,29 @@ impl CursorRenderer {
         let style = &self.cursor.grid_cell.1;
         let coarse_style = style.as_ref().map(|style| style.into()).unwrap_or_default();
 
+        let cell_size = GridSize::new(1, 1) * grid_renderer.grid_scale;
+        let scaled_cell_size =
+            PixelSize::new(cell_size.width * self.line_scale, cell_size.height * self.line_scale);
+
         let box_char_drawn = grid_renderer.box_char_renderer.draw_glyph(
             &character,
             canvas,
-            PixelRect::from_origin_and_size(
-                self.destination,
-                GridSize::new(1, 1) * grid_renderer.grid_scale,
-            ),
+            PixelRect::from_origin_and_size(self.destination, scaled_cell_size),
             foreground_color,
             PixelPos::default(),
         );
         if !box_char_drawn {
-            let pos = (self.destination.x, self.destination.y + baseline_offset);
             let blobs = &grid_renderer
                 .shaper
                 .shape_cached(Word::new(&character, &[character.len() as u8]), coarse_style);
+
+            canvas.save();
+            canvas.translate((self.destination.x, self.destination.y));
+            canvas.scale((self.line_scale, self.line_scale));
             for blob in blobs.iter() {
-                canvas.draw_text_blob(blob, pos, &paint);
+                canvas.draw_text_blob(blob, (0.0, baseline_offset), &paint);
             }
+            canvas.restore();
         }
 
         canvas.restore();
@@ -468,12 +486,13 @@ impl CursorRenderer {
             self.previous_vfx_mode = settings.vfx_mode.clone();
         }
 
-        let mut cursor_width = grid_renderer.grid_scale.width();
+        let mut cursor_width = grid_renderer.grid_scale.width() * self.line_scale;
         if self.cursor.double_width && self.cursor.shape == CursorShape::Block {
             cursor_width *= 2.0;
         }
 
-        let cursor_dimensions = PixelSize::new(cursor_width, grid_renderer.grid_scale.height());
+        let cursor_dimensions =
+            PixelSize::new(cursor_width, grid_renderer.grid_scale.height() * self.line_scale);
 
         let in_insert_mode = matches!(current_mode, EditorMode::Insert);
 

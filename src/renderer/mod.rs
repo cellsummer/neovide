@@ -496,26 +496,42 @@ impl Renderer {
         animating
     }
 
-    pub fn handle_config_changed(&mut self, config: RendererHotReloadConfigs) {
+    /// Returns the line scales when they changed, for the window layer to hand to Neovim.
+    pub fn handle_config_changed(
+        &mut self,
+        config: RendererHotReloadConfigs,
+    ) -> Option<Vec<(String, f32)>> {
+        let mut changed_line_scales = None;
+
         match config {
             RendererHotReloadConfigs::Font(font) => {
                 let font = *font;
                 let mut font_config_state = self.settings.get::<FontConfigState>();
                 font_config_state.has_font = font.is_some();
-                self.settings.set(&font_config_state);
-                match font {
-                    Some(font) => {
-                        self.grid_renderer.update_font_options(font.into());
-                    }
-                    None => {
-                        self.grid_renderer.update_font_options(FontOptions::default());
-                    }
+                let options = match font {
+                    Some(font) => FontOptions::from(font),
+                    None => FontOptions::default(),
+                };
+
+                let mut line_scales =
+                    options.line_scales.clone().into_iter().collect::<Vec<(String, f32)>>();
+                line_scales.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+                // The groups have to claim their attributes again before Neovim reports them
+                if line_scales != font_config_state.line_scales {
+                    font_config_state.line_scales = line_scales.clone();
+                    changed_line_scales = Some(line_scales);
                 }
+
+                self.settings.set(&font_config_state);
+                self.grid_renderer.update_font_options(options);
             }
             RendererHotReloadConfigs::BoxDrawing(settings) => {
                 self.grid_renderer.handle_box_drawing_update(settings.unwrap_or_default())
             }
         }
+
+        changed_line_scales
     }
 
     pub fn handle_draw_commands(&mut self, batch: Vec<DrawCommand>) -> DrawCommandResult {

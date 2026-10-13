@@ -8,6 +8,7 @@
 ---@field enable_focus_command boolean
 ---@field global_variable_settings string[]
 ---@field option_settings string[]
+---@field line_scales table<string, number>
 
 ---@type Args
 local args = ...
@@ -476,6 +477,125 @@ M.preedit_handler = function(preedit_raw_text, cursor_offset_start, cursor_offse
 ---@param commit_formatted_text string It's escaped.
 M.commit_handler = function(commit_raw_text, commit_formatted_text)
     vim.api.nvim_input(commit_formatted_text)
+end
+
+-- Line scaling ---------------------------------------------------------------
+--
+-- Neovide draws a whole grid line bigger when it carries a highlight group listed in
+-- `[font.line_scale]`. Neovim only tells a UI the *resolved* highlight group, so a group that
+-- merely links elsewhere (every `@markup.heading.N` links to `Title` by default) never arrives
+-- under its own name. Copying a group's resolved attributes onto the group itself makes it own an
+-- attribute entry, so Neovim reports its own name. The appearance does not change.
+
+M.private.line_scales = args.line_scales or {}
+
+local line_scale_namespace = vim.api.nvim_create_namespace("neovide_line_scale")
+
+local function materialize_line_scale_groups()
+    for group, _ in pairs(M.private.line_scales) do
+        local attributes = vim.api.nvim_get_hl(0, { name = group, link = false })
+        if next(attributes) ~= nil then
+            vim.api.nvim_set_hl(0, group, attributes)
+        end
+    end
+end
+
+---Replaces the scale table and re-applies it, for when the config is hot reloaded.
+---@param line_scales table<string, number>
+M.private.set_line_scales = function(line_scales)
+    M.private.line_scales = line_scales or {}
+    materialize_line_scale_groups()
+end
+
+materialize_line_scale_groups()
+
+-- A new colorscheme restores the links, so claim the groups again
+vim.api.nvim_create_autocmd("ColorScheme", {
+    group = vim.api.nvim_create_augroup("NeovideLineScale", { clear = true }),
+    desc = "Keep line scaled highlight groups owning their attributes",
+    callback = materialize_line_scale_groups,
+})
+
+---@param buf integer
+---@param row integer 0-indexed
+---@return number scale largest configured scale applying to the row
+local function line_scale_at(buf, row)
+    local line = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1]
+    if line == nil or line == "" then
+        return 1.0
+    end
+
+    -- The highlight usually starts at the first non-blank character
+    local column = (line:find("%S") or 1) - 1
+    local ok, position = pcall(vim.inspect_pos, buf, row, column)
+    if not ok then
+        return 1.0
+    end
+
+    local scale = 1.0
+    for _, source in ipairs({ "treesitter", "syntax", "extmarks", "semantic_tokens" }) do
+        for _, item in ipairs(position[source] or {}) do
+            local groups = { item.hl_group, item.hl_group_link }
+            if item.opts then
+                table.insert(groups, item.opts.hl_group)
+            end
+            for _, group in ipairs(groups) do
+                local configured = M.private.line_scales[group]
+                if configured ~= nil and configured > scale then
+                    scale = configured
+                end
+            end
+        end
+    end
+
+    return scale
+end
+
+---Reserves the rows that line scaled lines grow into, with virtual lines below each one.
+---Opt in by calling this from your own autocmd, for example:
+---
+---```lua
+---vim.api.nvim_create_autocmd({ "TextChanged", "InsertLeave", "WinScrolled" }, {
+---    callback = function() neovide.reserve_line_scale_rows() end,
+---})
+---```
+---
+---Costs one `vim.inspect_pos` per line in the range, so prefer the default visible range over
+---whole buffers. Leave it unused if a plugin already reserves space, like render-markdown.nvim's
+---`heading.below`, or the gaps stack.
+---@param opts? { buf?: integer, first?: integer, last?: integer } 1-indexed lines, as in `line()`
+---@return integer reserved number of lines given extra rows
+M.reserve_line_scale_rows = function(opts)
+    opts = opts or {}
+    local buf = opts.buf or vim.api.nvim_get_current_buf()
+    local first = (opts.first or vim.fn.line("w0")) - 1
+    local last = opts.last or vim.fn.line("w$")
+
+    local line_count = vim.api.nvim_buf_line_count(buf)
+    first = math.max(first, 0)
+    last = math.min(last, line_count)
+
+    vim.api.nvim_buf_clear_namespace(buf, line_scale_namespace, first, last)
+    if next(M.private.line_scales) == nil then
+        return 0
+    end
+
+    local reserved = 0
+    for row = first, last - 1 do
+        local extra_rows = math.ceil(line_scale_at(buf, row)) - 1
+        if extra_rows > 0 then
+            local virt_lines = {}
+            for _ = 1, extra_rows do
+                table.insert(virt_lines, { { "", "Normal" } })
+            end
+            vim.api.nvim_buf_set_extmark(buf, line_scale_namespace, row, 0, {
+                virt_lines = virt_lines,
+            })
+            reserved = reserved + 1
+        end
+    end
+
+    return reserved
 end
 
 _G["neovide"] = M

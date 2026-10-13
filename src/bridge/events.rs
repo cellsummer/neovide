@@ -661,10 +661,11 @@ fn parse_default_colors(default_colors_arguments: Vec<Value>) -> Result<RedrawEv
     })
 }
 
-fn parse_style(style_map: Value, _info_array: Value) -> Result<Style> {
+fn parse_style(style_map: Value, info_array: Value) -> Result<Style> {
     let attributes = parse_map(style_map)?;
 
     let mut style = Style::new(Colors::new(None, None, None));
+    style.hl_names = parse_hl_names(info_array).into();
 
     for attribute in attributes {
         if let (Value::String(name), value) = attribute {
@@ -712,7 +713,7 @@ fn parse_style(style_map: Value, _info_array: Value) -> Result<Style> {
     Ok(style)
 }
 
-fn parse_hl_name(infos: Value) -> Option<String> {
+fn parse_hl_names(infos: Value) -> Vec<String> {
     fn take_names(values: Vec<(Value, Value)>, names: &mut Vec<String>) {
         let possible_keys = ["hi_name", "ui_name", "name", "link"];
         for (key, value) in values {
@@ -738,6 +739,12 @@ fn parse_hl_name(infos: Value) -> Option<String> {
         }
         _ => {}
     }
+
+    names
+}
+
+fn parse_hl_name(infos: Value) -> Option<String> {
+    let names = parse_hl_names(infos);
 
     if let Some(name) = names.iter().find(|name| name.starts_with("MatchParen")) {
         return Some(name.clone());

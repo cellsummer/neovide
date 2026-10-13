@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 use crate::renderer::fonts::font_options::{
-    FontDescription, FontEdging, FontFeature, FontHinting, FontOptions, SecondaryFontDescription,
-    points_to_pixels,
+    FontDescription, FontEdging, FontFeature, FontHinting, FontOptions, MAX_LINE_SCALE,
+    NO_LINE_SCALE, SecondaryFontDescription, points_to_pixels,
 };
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -49,6 +49,7 @@ pub struct FontSettings {
     pub hinting: Option<String>,
     pub edging: Option<String>,
     pub underline_offset: Option<f32>,
+    pub line_scale: Option<HashMap<String /* highlight group */, f32 /* scale */>>,
 }
 
 impl From<FontDescriptionSettings> for Vec<FontDescription> {
@@ -74,7 +75,9 @@ impl From<SecondaryFontDescriptionSettings> for Vec<SecondaryFontDescription> {
 impl From<SimpleFontDescription> for FontDescription {
     fn from(value: SimpleFontDescription) -> Self {
         match value {
-            SimpleFontDescription::String(value) => FontDescription { family: value, style: None },
+            SimpleFontDescription::String(value) => {
+                FontDescription { family: value, ..Default::default() }
+            }
             SimpleFontDescription::Details(value) => value,
         }
     }
@@ -84,7 +87,7 @@ impl From<SimpleSecondaryFontDescription> for SecondaryFontDescription {
     fn from(value: SimpleSecondaryFontDescription) -> Self {
         match value {
             SimpleSecondaryFontDescription::String(value) => {
-                SecondaryFontDescription { family: Some(value), style: None }
+                SecondaryFontDescription { family: Some(value), ..Default::default() }
             }
             SimpleSecondaryFontDescription::Details(value) => value,
         }
@@ -127,6 +130,15 @@ impl From<FontSettings> for FontOptions {
                 .map(|edging| FontEdging::parse(&edging).unwrap_or_default())
                 .unwrap_or_default(),
             underline_offset: value.underline_offset.map(points_to_pixels),
+            line_scales: value
+                .line_scale
+                .map(|scales| {
+                    scales
+                        .into_iter()
+                        .map(|(name, scale)| (name, scale.clamp(NO_LINE_SCALE, MAX_LINE_SCALE)))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -136,6 +148,10 @@ mod tests {
     use crate::renderer::fonts::font_options::CoarseStyle;
 
     use super::*;
+
+    fn bold(family: &str) -> FontDescription {
+        FontDescription { family: family.into(), style: Some("Bold".into()), ..Default::default() }
+    }
 
     #[test]
     fn test_normal_font_single() {
@@ -239,14 +255,7 @@ mod tests {
         let fonts = options.font_list(style);
 
         assert_eq!(fonts.len(), 3);
-        assert_eq!(
-            fonts,
-            vec![
-                FontDescription { family: "NotFound".into(), style: Some("Bold".into()) },
-                FontDescription { family: "Consolas".into(), style: Some("Bold".into()) },
-                FontDescription { family: "Noto Emoji".into(), style: Some("Bold".into()) }
-            ]
-        );
+        assert_eq!(fonts, vec![bold("NotFound"), bold("Consolas"), bold("Noto Emoji")]);
     }
 
     #[test]
@@ -269,12 +278,25 @@ mod tests {
         assert_eq!(fonts.len(), 4);
         assert_eq!(
             fonts,
-            vec![
-                FontDescription { family: "NotFound".into(), style: Some("Bold".into()) },
-                FontDescription { family: "Menlo".into(), style: Some("Bold".into()) },
-                FontDescription { family: "Consolas".into(), style: Some("Bold".into()) },
-                FontDescription { family: "Noto Emoji".into(), style: Some("Bold".into()) }
-            ]
+            vec![bold("NotFound"), bold("Menlo"), bold("Consolas"), bold("Noto Emoji")]
         );
+    }
+
+    #[test]
+    fn test_line_scale_is_clamped() {
+        let settings = r#"
+        {
+            "normal": "Consolas",
+            "size": 19,
+            "line_scale": { "Huge": 99.0, "Shrunk": 0.2, "Sane": 2.5 }
+        }
+        "#;
+
+        let settings: FontSettings = serde_json::from_str(settings).unwrap();
+        let options = FontOptions::from(settings);
+
+        assert_eq!(options.line_scales["Huge"], MAX_LINE_SCALE);
+        assert_eq!(options.line_scales["Shrunk"], NO_LINE_SCALE);
+        assert_eq!(options.line_scales["Sane"], 2.5);
     }
 }

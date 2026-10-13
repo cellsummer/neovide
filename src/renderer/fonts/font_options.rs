@@ -1,9 +1,16 @@
-use std::{collections::HashMap, fmt, iter, num::ParseFloatError, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    hash::{Hash, Hasher},
+    iter,
+    num::ParseFloatError,
+    sync::Arc,
+};
 
 use itertools::Itertools;
 use log::warn;
 use rmpv::Value;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use skia_safe::{
     FontStyle,
     font_style::{Slant, Weight, Width},
@@ -24,18 +31,94 @@ const FONT_ITALIC_OPT: &str = "i";
 const INVALID_SIZE_ERR: &str = "Invalid size";
 const INVALID_WIDTH_ERR: &str = "Invalid width";
 
+/// Size multiplier of a grid line that carries no scaled highlight group.
+pub const NO_LINE_SCALE: f32 = 1.0;
+/// A line taller than this would claim more rows than any plausible reserved block.
+pub const MAX_LINE_SCALE: f32 = 8.0;
+
+/// Length of an OpenType variation axis tag, e.g. `wght`.
+const VARIATION_TAG_LEN: usize = 4;
+const WEIGHT_AXIS: &str = "wght";
+
+/// A single OpenType variation axis setting.
+#[derive(Clone, Debug)]
+pub struct FontVariation {
+    pub tag: String,
+    pub value: f32,
+}
+
+// Variation values take part in the font cache key, so they need Hash and Eq that f32 can't
+// derive.
+impl PartialEq for FontVariation {
+    fn eq(&self, other: &Self) -> bool {
+        self.tag == other.tag && self.value.to_bits() == other.value.to_bits()
+    }
+}
+
+impl Eq for FontVariation {}
+
+impl Hash for FontVariation {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.tag.hash(state);
+        self.value.to_bits().hash(state);
+    }
+}
+
+impl fmt::Display for FontVariation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}={}", self.tag, self.value)
+    }
+}
+
 /// Description of the normal font.
 #[derive(Clone, Debug, Deserialize, PartialEq, Hash, Eq, Default)]
 pub struct FontDescription {
     pub family: String,
     pub style: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_variations")]
+    pub variations: Vec<FontVariation>,
 }
 
 /// Description of the italic and bold fonts.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Default)]
 pub struct SecondaryFontDescription {
     pub family: Option<String>,
     pub style: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_variations")]
+    pub variations: Vec<FontVariation>,
+}
+
+/// Parses an axis table, e.g. `{ wght = 350, wdth = 85 }`.
+fn deserialize_variations<'de, D>(deserializer: D) -> Result<Vec<FontVariation>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(sorted_variations(HashMap::<String, f32>::deserialize(deserializer)?))
+}
+
+/// Sorting keeps the derived font cache key stable, the axis table has no inherent order.
+fn sorted_variations(axes: HashMap<String, f32>) -> Vec<FontVariation> {
+    axes.into_iter()
+        .filter_map(|(tag, value)| {
+            if tag.len() == VARIATION_TAG_LEN && tag.is_ascii() {
+                Some(FontVariation { tag, value })
+            } else {
+                warn!("Wrong variation axis format: {tag}");
+                None
+            }
+        })
+        .sorted_by(|left, right| left.tag.cmp(&right.tag))
+        .collect()
+}
+
+/// Bold text falls back to the normal font asked for in a bold style. An inherited `wght` axis
+/// would pin that fallback to the normal weight, so leave the weight to style matching.
+fn inherited_variations(variations: &[FontVariation], style: CoarseStyle) -> Vec<FontVariation> {
+    variations
+        .iter()
+        .filter(|variation| !(style.bold && variation.tag == WEIGHT_AXIS))
+        .cloned()
+        .collect()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -105,6 +188,8 @@ pub struct FontOptions {
     pub hinting: FontHinting,
     pub edging: FontEdging,
     pub underline_offset: Option<f32>,
+    /// Size multiplier per highlight group, applied to whole grid lines.
+    pub line_scales: HashMap<String /* highlight group */, f32 /* scale */>,
 }
 
 impl FontFeature {
@@ -145,7 +230,7 @@ impl FontOptions {
             if !parsed_font_list.is_empty() {
                 font_options.normal = parsed_font_list
                     .into_iter()
-                    .map(|family| FontDescription { family, style: None })
+                    .map(|family| FontDescription { family, ..Default::default() })
                     .collect();
             }
         }
@@ -198,6 +283,7 @@ impl FontOptions {
             // use current requested font style instead of normal
             style: style.name().map(str::to_string),
             family: font.family.clone(),
+            variations: inherited_variations(&font.variations, style),
         });
 
         fonts
@@ -205,15 +291,20 @@ impl FontOptions {
             .map(|fonts| {
                 fonts
                     .iter()
-                    .filter(|font| font.family.is_some() || font.style.is_some())
+                    .filter(|font| {
+                        font.family.is_some() || font.style.is_some() || !font.variations.is_empty()
+                    })
                     .map(|font| {
                         if font.family.is_none() && self.primary_font().is_some() {
-                            error_msg!("Font style {:?} is missing font family", font.style);
-                            // only has style specified, use primary font family
+                            if font.variations.is_empty() {
+                                error_msg!("Font style {:?} is missing font family", font.style);
+                            }
+                            // only has style or variations specified, use primary font family
                             self.primary_font()
                                 .map(|primary_font| FontDescription {
                                     family: primary_font.family.clone(),
                                     style: font.style.clone(),
+                                    variations: font.variations.clone(),
                                 })
                                 .unwrap()
                         } else {
@@ -223,6 +314,7 @@ impl FontOptions {
                                     .style
                                     .clone()
                                     .or_else(|| style.name().map(str::to_string)),
+                                variations: font.variations.clone(),
                             }
                         }
                     })
@@ -230,6 +322,15 @@ impl FontOptions {
                     .collect()
             })
             .unwrap_or_else(|| normal_fallback.collect())
+    }
+
+    /// The largest scale configured for any of the given highlight groups.
+    pub fn line_scale(&self, hl_names: &[String]) -> f32 {
+        hl_names
+            .iter()
+            .filter_map(|name| self.line_scales.get(name))
+            .copied()
+            .fold(NO_LINE_SCALE, f32::max)
     }
 
     pub fn possible_fonts(&self) -> Vec<FontDescription> {
@@ -253,6 +354,7 @@ impl Default for FontOptions {
             hinting: FontHinting::default(),
             edging: FontEdging::default(),
             underline_offset: None,
+            line_scales: HashMap::new(),
         }
     }
 }
@@ -267,6 +369,7 @@ impl PartialEq for FontOptions {
             && self.edging == other.edging
             && (self.size - other.size).abs() < f32::EPSILON
             && self.hinting == other.hinting
+            && self.line_scales == other.line_scales
     }
 }
 
@@ -412,8 +515,16 @@ impl FontDescription {
         // support font slants:
         // Upright, Italic, Oblique
 
+        // A variable weight steers matching towards the variable face instead of a static Bold
+        // file. The exact position is applied afterwards, when the typeface is cloned.
+        let variable_weight = self
+            .variations
+            .iter()
+            .find(|variation| variation.tag == WEIGHT_AXIS)
+            .map(|variation| Weight::from(variation.value as i32));
+
         let style = if let Some(style) = &self.style {
-            let mut weight = Weight::NORMAL;
+            let mut weight = variable_weight.unwrap_or(Weight::NORMAL);
             let mut slant = Slant::Upright;
 
             for part in style.split_whitespace() {
@@ -440,6 +551,8 @@ impl FontDescription {
                 }
             }
             FontStyle::new(weight, Width::NORMAL, slant)
+        } else if let Some(weight) = variable_weight {
+            FontStyle::new(weight, Width::NORMAL, Slant::Upright)
         } else {
             FontStyle::default()
         };
@@ -452,6 +565,9 @@ impl fmt::Display for FontDescription {
         write!(f, "{}", self.family)?;
         if let Some(style) = &self.style {
             write!(f, " {style}")?;
+        }
+        if !self.variations.is_empty() {
+            write!(f, " ({})", self.variations.iter().join(", "))?;
         }
         Ok(())
     }
@@ -664,6 +780,7 @@ mod tests {
         let font_style = FontDescription {
             family: "Fira Code Mono".to_string(),
             style: Some("Bold Italic".to_string()),
+            ..Default::default()
         };
 
         let (family, style) = font_style.as_family_and_font_style();
@@ -683,6 +800,7 @@ mod tests {
         let font_style = FontDescription {
             family: "Fira Code Mono".to_string(),
             style: Some("SemiBold".to_string()),
+            ..Default::default()
         };
 
         let (family, style) = font_style.as_family_and_font_style();
@@ -702,6 +820,7 @@ mod tests {
         let font_style = FontDescription {
             family: "Fira Code Mono".to_string(),
             style: Some("W100".to_string()),
+            ..Default::default()
         };
 
         let (family, style) = font_style.as_family_and_font_style();
@@ -714,5 +833,88 @@ mod tests {
 
         assert_eq!(style.weight(), Weight::from(100));
         assert_eq!(style.slant(), Slant::Upright);
+    }
+
+    #[test]
+    fn test_parse_variations_sorted_and_filtered() {
+        let settings =
+            r#"{ "family": "Inconsolata", "variations": { "wdth": 85, "wght": 350.5, "wg": 1 } }"#;
+        let font: FontDescription = serde_json::from_str(settings).unwrap();
+
+        assert_eq!(
+            font.variations,
+            vec![
+                FontVariation { tag: "wdth".to_string(), value: 85.0 },
+                FontVariation { tag: "wght".to_string(), value: 350.5 },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_variable_weight_steers_style_matching() {
+        let font = FontDescription {
+            family: "Inconsolata".to_string(),
+            style: None,
+            variations: vec![FontVariation { tag: "wght".to_string(), value: 350.0 }],
+        };
+
+        let (_, style) = font.as_family_and_font_style();
+
+        assert_eq!(style.weight(), Weight::from(350));
+    }
+
+    #[test]
+    fn test_explicit_style_overrides_variable_weight() {
+        let font = FontDescription {
+            family: "Inconsolata".to_string(),
+            style: Some("Bold".to_string()),
+            variations: vec![FontVariation { tag: "wght".to_string(), value: 350.0 }],
+        };
+
+        let (_, style) = font.as_family_and_font_style();
+
+        assert_eq!(style.weight(), Weight::BOLD);
+    }
+
+    #[test]
+    fn test_bold_fallback_drops_inherited_weight() {
+        let options = FontOptions {
+            normal: vec![FontDescription {
+                family: "Inconsolata".to_string(),
+                style: None,
+                variations: vec![
+                    FontVariation { tag: "wdth".to_string(), value: 85.0 },
+                    FontVariation { tag: "wght".to_string(), value: 350.0 },
+                ],
+            }],
+            ..FontOptions::default()
+        };
+
+        let bold = CoarseStyle::permutations().find(|style| style.name() == Some("Bold")).unwrap();
+        let italic =
+            CoarseStyle::permutations().find(|style| style.name() == Some("Italic")).unwrap();
+
+        assert_eq!(
+            options.font_list(bold)[0].variations,
+            vec![FontVariation { tag: "wdth".to_string(), value: 85.0 }]
+        );
+        assert_eq!(options.font_list(italic)[0].variations, options.normal[0].variations);
+    }
+
+    #[test]
+    fn test_line_scale_takes_the_largest_configured_group() {
+        let options = FontOptions {
+            line_scales: HashMap::from([
+                ("@markup.heading.1".to_string(), 3.0),
+                ("Title".to_string(), 2.0),
+            ]),
+            ..FontOptions::default()
+        };
+
+        // Neovim reports combined highlight states with every contributing group
+        assert_eq!(options.line_scale(&["Title".into(), "@markup.heading.1".into()]), 3.0);
+        assert_eq!(options.line_scale(&["Title".into()]), 2.0);
+        assert_eq!(options.line_scale(&["Comment".into()]), NO_LINE_SCALE);
+        assert_eq!(options.line_scale(&[]), NO_LINE_SCALE);
     }
 }

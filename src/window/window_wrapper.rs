@@ -2132,8 +2132,13 @@ impl WinitWindowWrapper {
             return;
         };
 
-        let mut renderer = route.window.renderer.borrow_mut();
-        renderer.handle_config_changed(config);
+        let changed_line_scales =
+            { route.window.renderer.borrow_mut().handle_config_changed(config) };
+
+        if let Some(line_scales) = changed_line_scales {
+            send_ui(ParallelCommand::SetLineScales(line_scales), &route.window.neovim_handler);
+        }
+
         route.state.font_changed_last_frame = true;
     }
 

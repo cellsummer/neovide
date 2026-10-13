@@ -35,11 +35,15 @@ pub trait SettingGroup {
 #[derive(Clone, Debug)]
 pub struct FontConfigState {
     pub has_font: bool,
+    /// Highlight groups with a configured line scale, paired with it. Neovim only reports the
+    /// resolved highlight group to a UI, so these groups have to be made to own their attributes
+    /// before a scale can be matched against them.
+    pub line_scales: Vec<(String, f32)>,
 }
 
 impl FontConfigState {
     pub fn new() -> Self {
-        Self { has_font: false }
+        Self { has_font: false, line_scales: Vec::new() }
     }
 }
 

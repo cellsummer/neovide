@@ -16,7 +16,10 @@ use glamour::{Contains, Point2};
 use crate::{
     bridge::{NeovimHandler, SerialCommand, send_ui},
     editor::WindowType,
-    renderer::{MessageSelection, Renderer, WindowDrawDetails},
+    renderer::{
+        MessageSelection, RenderedWindow, Renderer, WindowDrawDetails,
+        fonts::font_options::NO_LINE_SCALE,
+    },
     settings::Settings,
     units::{GridPos, GridScale, GridSize, GridVec, PixelPos, PixelRect, PixelSize, PixelVec},
     window::{WindowSettings, keyboard_manager::KeyboardManager},
@@ -87,6 +90,16 @@ pub struct EditorState<'a> {
     pub full_region: WindowDrawDetails,
     pub window: &'a Window,
     pub keyboard_manager: &'a KeyboardManager,
+    pub rendered_windows: &'a HashMap<u64, RenderedWindow>,
+}
+
+impl EditorState<'_> {
+    /// The row drawn over `row` in the given grid, and the scale it is drawn with.
+    fn line_covering_row(&self, grid_id: u64, row: isize) -> (isize, f32) {
+        self.rendered_windows
+            .get(&grid_id)
+            .map_or((row, NO_LINE_SCALE), |window| window.line_covering_row(row))
+    }
 }
 
 #[derive(Debug)]
@@ -214,8 +227,14 @@ impl MouseManager {
         editor_state: &EditorState,
     ) -> GridPos<u32> {
         let relative_position = (window_position - window_details.region.min).to_point();
-        (relative_position / *editor_state.grid_scale)
-            .floor()
+        let grid_scale = *editor_state.grid_scale;
+
+        let pointed_row = (relative_position.y / grid_scale.height()).floor();
+        let (row, scale) = editor_state.line_covering_row(window_details.id, pointed_row as isize);
+        // An oversized line spreads its columns by the factor it is drawn with
+        let column = relative_position.x / (grid_scale.width() * scale);
+
+        GridPos::<f32>::new(column.floor(), row as f32)
             .max((0.0, 0.0).into())
             .try_cast()
             .unwrap()
@@ -676,6 +695,7 @@ impl MouseManager {
             full_region,
             window,
             keyboard_manager,
+            rendered_windows: &renderer.rendered_windows,
         };
         let hide_mouse_when_typing = self.settings.get::<WindowSettings>().hide_mouse_when_typing;
         let mut overlay_event = OverlayEvent::default();

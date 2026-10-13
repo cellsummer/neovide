@@ -366,6 +366,7 @@ pub enum ParallelCommand {
     FocusLost,
     FocusGained,
     DisplayAvailableFonts(Vec<String>),
+    SetLineScales(Vec<(String, f32)>),
     ShowError { lines: Vec<String> },
     SetBackground { background: String },
     FlushStartupMessages { messages: Vec<StartupMessage> },
@@ -541,6 +542,20 @@ impl ParallelCommand {
                 .context("FileDrop failed"),
             ParallelCommand::DisplayAvailableFonts(fonts) => {
                 display_available_fonts(nvim, fonts).await.context("DisplayAvailableFonts failed")
+            }
+            ParallelCommand::SetLineScales(line_scales) => {
+                let line_scales = line_scales
+                    .into_iter()
+                    .map(|(group, scale)| (Value::from(group), Value::from(scale)))
+                    .collect::<Vec<_>>();
+
+                nvim.call(
+                    "nvim__exec_lua_fast",
+                    call_args!["neovide.private.set_line_scales", vec![Value::Map(line_scales)]],
+                )
+                .await
+                .map(|_| ())
+                .context("SetLineScales failed")
             }
             ParallelCommand::ShowError { lines } => {
                 // nvim.err_write(&message).await.ok();

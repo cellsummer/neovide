@@ -10,7 +10,11 @@ use crate::{
     cmd_line::CmdLineSettings,
     editor::{AnchorInfo, Line, LineFragment, SortOrder, WindowType},
     profiling::{tracy_plot, tracy_zone},
-    renderer::{GridRenderer, RendererSettings, animation_utils::*},
+    renderer::{
+        GridRenderer, RendererSettings,
+        animation_utils::*,
+        fonts::font_options::{MAX_LINE_SCALE, NO_LINE_SCALE},
+    },
     settings::Settings,
     units::{GridPos, GridRect, GridScale, GridSize, PixelPos, PixelRect, PixelVec, to_skia_rect},
     utils::RingBuffer,
@@ -78,6 +82,14 @@ struct RenderedLine {
     trailing_background: Option<Color4f>,
     has_transparency: bool,
     is_valid: bool,
+    /// Size multiplier applied when the recorded pictures are replayed. The pictures themselves
+    /// are always recorded at base size, so a changed scale needs no re-record.
+    scale: f32,
+}
+
+/// Rows an oversized line covers, including its own.
+fn claimed_rows(scale: f32) -> isize {
+    scale.ceil() as isize
 }
 
 /// Background color for a half-open cell range on one rendered line.
@@ -344,7 +356,9 @@ impl RenderedWindow {
         for (mut matrix, line) in self.iter_border_lines_with_transform(pixel_region, grid_scale) {
             let line = line.borrow();
             if let Some((boxchar_picture, position)) = &line.boxchar_picture {
-                let deltax = pixel_region.min.x - position.x;
+                // Box chars are recorded offset by the window position, so undo that offset in
+                // the same space the picture is replayed in
+                let deltax = pixel_region.min.x - position.x * matrix.scale_x();
                 matrix.set_translate_x(deltax);
                 canvas.draw_picture(boxchar_picture, Some(&matrix), None);
             }
@@ -356,7 +370,9 @@ impl RenderedWindow {
         {
             let line = line.borrow();
             if let Some((boxchar_picture, position)) = &line.boxchar_picture {
-                let deltax = pixel_region.min.x - position.x;
+                // Box chars are recorded offset by the window position, so undo that offset in
+                // the same space the picture is replayed in
+                let deltax = pixel_region.min.x - position.x * matrix.scale_x();
                 matrix.set_translate_x(deltax);
                 canvas.draw_picture(boxchar_picture, Some(&matrix), None);
             }
@@ -811,6 +827,7 @@ impl RenderedWindow {
                     trailing_background: None,
                     has_transparency: false,
                     is_valid: false,
+                    scale: NO_LINE_SCALE,
                 };
 
                 self.actual_lines[row] = Some(Rc::new(RefCell::new(line)));
@@ -951,15 +968,27 @@ impl RenderedWindow {
     ) -> impl Iterator<Item = (Matrix, &Rc<RefCell<RenderedLine>>)> {
         let scroll_offset_pixels = self.scroll_offset_pixels(grid_scale.height());
 
-        self.iter_scrollable_lines().map(move |(i, line)| {
+        let mut first_free_row = isize::MIN;
+
+        self.iter_scrollable_lines().filter_map(move |(i, line)| {
+            let row = i + self.viewport_margins.top as isize;
+            if row < first_free_row {
+                // Covered by an oversized line above
+                return None;
+            }
+
+            let scale = line.borrow().scale;
+            first_free_row = row + claimed_rows(scale);
+
             let mut matrix = Matrix::new_identity();
             matrix.set_translate((
                 pixel_region.min.x,
-                pixel_region.min.y
-                    + (scroll_offset_pixels
-                        + ((i + self.viewport_margins.top as isize) as f32 * grid_scale.height())),
+                pixel_region.min.y + (scroll_offset_pixels + (row as f32 * grid_scale.height())),
             ));
-            (matrix, line)
+            if scale > NO_LINE_SCALE {
+                matrix.pre_scale((scale, scale), None);
+            }
+            Some((matrix, line))
         })
     }
 
@@ -968,13 +997,25 @@ impl RenderedWindow {
         pixel_region: PixelRect<f32>,
         grid_scale: GridScale,
     ) -> impl Iterator<Item = (Matrix, &Rc<RefCell<RenderedLine>>)> {
-        self.iter_border_lines().map(move |(i, line)| {
+        let mut first_free_row = isize::MIN;
+
+        self.iter_border_lines().filter_map(move |(i, line)| {
+            if i < first_free_row {
+                return None;
+            }
+
+            let scale = line.borrow().scale;
+            first_free_row = i + claimed_rows(scale);
+
             let mut matrix = Matrix::new_identity();
             matrix.set_translate((
                 pixel_region.min.x,
                 pixel_region.min.y + (i as f32 * grid_scale.height()),
             ));
-            (matrix, line)
+            if scale > NO_LINE_SCALE {
+                matrix.pre_scale((scale, scale), None);
+            }
+            Some((matrix, line))
         })
     }
 
@@ -990,6 +1031,49 @@ impl RenderedWindow {
         );
 
         to_skia_rect(&adjusted_region)
+    }
+
+    /// Size multiplier of the line occupying this window row. Rows covered by an oversized line
+    /// above them report their own scale, not the covering one.
+    pub fn line_scale_at_row(&self, row: isize) -> f32 {
+        let actual_line_count = self.actual_lines.len() as isize;
+        if row < 0 || row >= actual_line_count || self.scrollback_lines.is_empty() {
+            return NO_LINE_SCALE;
+        }
+
+        let top = self.viewport_margins.top as isize;
+        let bottom_border_start = actual_line_count - self.viewport_margins.bottom as isize;
+
+        let line = if row < top || row >= bottom_border_start {
+            self.actual_lines[row].as_ref()
+        } else {
+            let scroll_offset_lines = self.scroll_animation.position.floor() as isize;
+            self.scrollback_lines[scroll_offset_lines + row - top].as_ref()
+        };
+
+        line.map_or(NO_LINE_SCALE, |line| line.borrow().scale)
+    }
+
+    /// The row whose line is actually drawn over this row, with its scale. An oversized line
+    /// above claims this row, so a pointer landing here belongs to that line. Which rows are
+    /// claimed depends on the whole chain above, so replay it the way the draw pass does, from
+    /// far enough back that the chain has settled.
+    pub fn line_covering_row(&self, row: isize) -> (isize, f32) {
+        let lookback = 2 * claimed_rows(MAX_LINE_SCALE);
+        let mut anchor = (row, NO_LINE_SCALE);
+        let mut first_free_row = row - lookback;
+
+        for candidate in (row - lookback)..=row {
+            if candidate < first_free_row {
+                continue;
+            }
+
+            let scale = self.line_scale_at_row(candidate);
+            first_free_row = candidate + claimed_rows(scale);
+            anchor = (candidate, scale);
+        }
+
+        anchor
     }
 
     pub fn prepare_lines(&mut self, grid_renderer: &mut GridRenderer, opacity: f32, force: bool) {
@@ -1070,6 +1154,14 @@ impl RenderedWindow {
             line.boxchar_picture = boxchar_picture;
             line.trailing_background = trailing_background;
             line.has_transparency = has_transparency;
+            line.scale = line
+                .line
+                .fragments()
+                .map(|fragment| grid_renderer.line_scale(fragment.style))
+                .fold(NO_LINE_SCALE, f32::max);
+            if line.scale > NO_LINE_SCALE {
+                log::trace!("Line scaled {}x: {:?}", line.scale, line.line.text);
+            }
             line.is_valid = true;
         };
 
@@ -1258,7 +1350,7 @@ fn push_fill_rect_path(builder: &mut PathBuilder, bounds: &mut Option<Rect>, rec
 #[cfg(test)]
 mod tests {
     use crate::units::PixelSize;
-    use skia_safe::Color4f;
+    use skia_safe::{Color4f, surfaces};
 
     use super::*;
 
@@ -1347,7 +1439,116 @@ mod tests {
             trailing_background: None,
             has_transparency: false,
             is_valid: true,
+            scale: NO_LINE_SCALE,
         }))
+    }
+
+    fn scaled_rendered_line(scale: f32) -> Rc<RefCell<RenderedLine>> {
+        let line = test_rendered_line();
+        line.borrow_mut().scale = scale;
+        line
+    }
+
+    #[test]
+    fn oversized_line_scales_its_transform_and_covers_the_rows_below() {
+        let grid_scale = grid_scale();
+        let mut window = positioned_rendered_window((20, 4));
+        let pixel_region = window.pixel_region(grid_scale);
+
+        let oversized = scaled_rendered_line(3.0);
+        window.scrollback_lines[0] = Some(Rc::clone(&oversized));
+        window.scrollback_lines[1] = Some(test_rendered_line());
+        window.scrollback_lines[2] = Some(test_rendered_line());
+        window.scrollback_lines[3] = Some(test_rendered_line());
+
+        let drawn = window
+            .iter_scrollable_lines_with_transform(pixel_region, grid_scale)
+            .map(|(matrix, line)| (matrix, Rc::clone(line)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(drawn.len(), 2, "rows 1 and 2 are covered by the oversized line");
+
+        let (matrix, line) = &drawn[0];
+        assert!(Rc::ptr_eq(line, &oversized));
+        assert_eq!(matrix.scale_x(), 3.0);
+        assert_eq!(matrix.scale_y(), 3.0);
+        assert_eq!(matrix.translate_y(), pixel_region.min.y);
+
+        let (matrix, _) = &drawn[1];
+        assert_eq!(matrix.scale_x(), 1.0);
+        assert_eq!(matrix.translate_y(), pixel_region.min.y + 3.0 * grid_scale.height());
+    }
+
+    fn one_cell_picture(color: Color, grid_scale: GridScale) -> Picture {
+        let cell = GridSize::new(1, 1) * grid_scale;
+        let cell_rect = Rect::from_wh(cell.width, cell.height);
+
+        let mut recorder = PictureRecorder::new();
+        let canvas = recorder.begin_recording(cell_rect, false);
+        let mut paint = Paint::default();
+        paint.set_color(color);
+        canvas.draw_rect(cell_rect, &paint);
+
+        recorder.finish_recording_as_picture(None).unwrap()
+    }
+
+    #[test]
+    fn oversized_line_paints_over_the_rows_it_claims() {
+        let grid_scale = grid_scale();
+        let mut window = positioned_rendered_window((20, 4));
+        let pixel_region = window.pixel_region(grid_scale);
+
+        let line = scaled_rendered_line(3.0);
+        line.borrow_mut().background_picture = Some(one_cell_picture(Color::RED, grid_scale));
+        window.scrollback_lines[0] = Some(line);
+
+        let mut surface = surfaces::raster_n32_premul((160, 64)).unwrap();
+        surface.canvas().clear(Color::BLACK);
+        window.draw_background_surface(surface.canvas(), pixel_region, grid_scale);
+        let pixmap = surface.peek_pixels().unwrap();
+
+        // A 3x line covers three cells across and three rows down
+        assert_eq!(pixmap.get_color((23, 47)), Color::RED);
+        assert_eq!(pixmap.get_color((25, 47)), Color::BLACK, "no bleed past three cells");
+        assert_eq!(pixmap.get_color((23, 49)), Color::BLACK, "no bleed past three rows");
+    }
+
+    #[test]
+    fn fractional_scale_draws_exactly_and_claims_whole_rows() {
+        let grid_scale = grid_scale();
+        let mut window = positioned_rendered_window((20, 6));
+        let pixel_region = window.pixel_region(grid_scale);
+
+        window.scrollback_lines[0] = Some(scaled_rendered_line(2.5));
+        for row in 1..6 {
+            window.scrollback_lines[row] = Some(test_rendered_line());
+        }
+
+        let drawn = window
+            .iter_scrollable_lines_with_transform(pixel_region, grid_scale)
+            .map(|(matrix, _)| matrix)
+            .collect::<Vec<_>>();
+
+        // Drawn at the exact fraction
+        assert_eq!(drawn[0].scale_y(), 2.5);
+        // But three rows are reserved, so the next line starts a half row further down
+        assert_eq!(drawn[1].translate_y(), pixel_region.min.y + 3.0 * grid_scale.height());
+        assert_eq!(window.line_covering_row(2), (0, 2.5));
+        assert_eq!(window.line_covering_row(3), (3, NO_LINE_SCALE));
+    }
+
+    #[test]
+    fn rows_under_an_oversized_line_resolve_to_it() {
+        let mut window = positioned_rendered_window((20, 4));
+        window.scrollback_lines[0] = Some(scaled_rendered_line(3.0));
+        window.scrollback_lines[1] = Some(test_rendered_line());
+        window.scrollback_lines[2] = Some(test_rendered_line());
+        window.scrollback_lines[3] = Some(test_rendered_line());
+
+        assert_eq!(window.line_covering_row(0), (0, 3.0));
+        assert_eq!(window.line_covering_row(1), (0, 3.0));
+        assert_eq!(window.line_covering_row(2), (0, 3.0));
+        assert_eq!(window.line_covering_row(3), (3, NO_LINE_SCALE));
     }
 
     fn positioned_rendered_window(grid_size: (u64, u64)) -> RenderedWindow {
